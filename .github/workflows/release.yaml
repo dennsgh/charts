@@ -1,32 +1,88 @@
-name: Release Charts
-
+name: Release Helm (multi-chart)
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+    paths:
+      - 'charts/**'
+      - '.github/workflows/release-helm.yml'
+      - 'release-config/release.helm.cjs'
+      - '!changelogs/CHANGELOG.*.md'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  packages: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  release:
-    # depending on default permission settings for your org (contents being read-only or read-write for workloads), you will have to add permissions
-    # see: https://docs.github.com/en/actions/security-guides/automatic-token-authentication#modifying-the-permissions-for-the-github_token
-    permissions:
-      contents: write
+  detect:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+      count:  ${{ steps.set.outputs.count }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-
-      - name: Configure Git
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - id: set
+        shell: bash
         run: |
-          git config user.name "$GITHUB_ACTOR"
-          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+          set -euo pipefail
+          BASE_SHA=$(git rev-parse HEAD~1 || true)
+          if [[ -z "${BASE_SHA}" ]]; then BASE_SHA=$(git rev-list --max-parents=0 HEAD); fi
+          mapfile -t CHANGED < <(git diff --name-only "${BASE_SHA}"..HEAD | grep '^charts/' || true)
 
-      - name: Install Helm
-        uses: azure/setup-helm@v3
+          declare -A ROOTS=()
+          for f in "${CHANGED[@]}"; do
+            d="$f"
+            while [[ "$d" != "." && -n "$d" ]]; do
+              if [[ -f "$d/Chart.yaml" ]]; then ROOTS["$d"]=1; break; fi
+              d=$(dirname "$d")
+            done
+          done
 
-      - name: Run chart-releaser
-        uses: helm/chart-releaser-action@v1.6.0
+          arr=()
+          for r in "${!ROOTS[@]}"; do
+            name=$(basename "$r")
+            arr+=( "{\"chart\":\"$r\",\"name\":\"$name\"}" )
+          done
+
+          COUNT=${#arr[@]}
+          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+
+          if [[ $COUNT -eq 0 ]]; then
+            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+          else
+            IFS=, eval 'echo "matrix={\"include\":[${arr[*]}]}"' >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    needs: detect
+    if: ${{ needs.detect.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.detect.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with: { version: v3.15.3 }
+      - name: Helm login to GHCR (OCI)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Install release deps
+        run: |
+          npm i -D semantic-release @semantic-release/changelog @semantic-release/git @semantic-release/github semantic-release-helm3
+      - name: Release chart
         env:
-          CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHART_PATH: ${{ matrix.chart }}
+          CHART_NAME: ${{ matrix.name }}
+        run: npx semantic-release -e ./.github/release-config/release.helm.cjs

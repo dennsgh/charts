@@ -1,0 +1,11 @@
+LLDAP has been installed.
+
+LDAP (plain):      {{ include "lldap.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.ldapPort }}
+LDAPS (optional):  {{ include "lldap.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.ldapsPort }}
+Web UI:            http://{{ include "lldap.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.httpPort }}
+
+Admin user:        (short name) from secret key LLDAP_LDAP_USER_DN
+Admin password:    from secret key LLDAP_LDAP_USER_PASS
+Base DN:           {{ .Values.lldap.baseDN }}
+
+If bootstrap is enabled, users/groups were seeded via hook Job.
