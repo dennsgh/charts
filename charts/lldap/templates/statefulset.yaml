@@ -1,0 +1,175 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "lldap.server.name" . }}
+  labels:
+    {{- include "lldap.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "lldap.server.serviceName" . }}
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "lldap.selectorLabels" (dict "name" (include "lldap.name" .) "root" .) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "lldap.server.podLabels" . | nindent 8 }}
+      annotations:
+        {{- include "lldap.server.podAnnotations" . | nindent 8 }}
+        {{- /* Precompute secret resourceVersion safely */ -}}
+        {{- $secretRV := "0" -}}
+        {{- if .Values.lldap.existingSecret -}}
+          {{- $sec := lookup "v1" "Secret" .Release.Namespace .Values.lldap.existingSecret -}}
+          {{- if $sec -}}
+            {{- $secretRV = (default "0" $sec.metadata.resourceVersion | toString) -}}
+          {{- end -}}
+        {{- end }}
+        checksum/secret: "{{ $secretRV }}"
+        checksum/config: "{{ include (print $.Template.BasePath "/config-bootstrap.yaml") . | sha256sum }}"
+    spec:
+      serviceAccountName: {{ include "lldap.server.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: lldap
+          image: "{{ include "lldap.image" . }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: ldap
+              containerPort: 3890
+            - name: ldaps
+              containerPort: 6360
+            - name: http
+              containerPort: 17170
+          env:
+            - name: LLDAP_LDAP_BASE_DN
+              value: {{ .Values.lldap.baseDN | quote }}
+            - name: LLDAP_LDAP_USER_DN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ default (printf "%s-secrets" (include "lldap.fullname" .)) .Values.lldap.existingSecret }}
+                  key: LLDAP_LDAP_USER_DN
+            - name: LLDAP_LDAP_USER_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ default (printf "%s-secrets" (include "lldap.fullname" .)) .Values.lldap.existingSecret }}
+                  key: LLDAP_LDAP_USER_PASS
+            - name: LLDAP_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ default (printf "%s-secrets" (include "lldap.fullname" .)) .Values.lldap.existingSecret }}
+                  key: LLDAP_JWT_SECRET
+            - name: LLDAP_KEY_SEED
+              valueFrom:
+                secretKeyRef:
+                  name: {{ default (printf "%s-secrets" (include "lldap.fullname" .)) .Values.lldap.existingSecret }}
+                  key: LLDAP_KEY_SEED
+            - name: LLDAP_LDAPS_OPTIONS__ENABLED
+              value: {{ ternary "true" "false" .Values.ldaps.enabled | quote }}
+            {{- if and .Values.ldaps.enabled .Values.ldaps.existingSecret }}
+            - name: LLDAP_LDAPS_OPTIONS__CERT_FILE
+              value: "/tls/tls.crt"
+            - name: LLDAP_LDAPS_OPTIONS__KEY_FILE
+              value: "/tls/tls.key"
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            {{- if and .Values.ldaps.enabled .Values.ldaps.existingSecret }}
+            - name: ldaps-cert
+              mountPath: /tls
+              readOnly: true
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: ldap
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+        - name: bootstrap
+          image: "{{ include "lldap.image" . }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh","-ceu"]
+          args:
+            - |
+              # Wait for the in-pod HTTP port, then run native bootstrap.
+              LLDAP_URL="http://127.0.0.1:17170"
+              for i in $(seq 1 120); do
+                wget -qO- "${LLDAP_URL}" >/dev/null 2>&1 && break
+                sleep 2
+              done
+              export LLDAP_URL
+              export DO_CLEANUP={{ ternary "true" "false" .Values.bootstrap.cleanup }}
+              export LLDAP_ADMIN_USERNAME="$(cat /secrets/LLDAP_LDAP_USER_DN)"
+              export LLDAP_ADMIN_PASSWORD="$(cat /secrets/LLDAP_LDAP_USER_PASS)"
+              /app/bootstrap.sh
+          volumeMounts:
+            - name: bootstrap-users
+              mountPath: /bootstrap/user-configs
+              readOnly: true
+            - name: bootstrap-groups
+              mountPath: /bootstrap/group-configs
+              readOnly: true
+            - name: secrets
+              mountPath: /secrets
+              readOnly: true
+          resources:
+            requests:
+              cpu: 5m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+
+      volumes:
+        - name: bootstrap-users
+          configMap:
+            name: {{ include "lldap.fullname" . }}-bootstrap
+            items:
+              - key: users.json
+                path: users.json
+        - name: bootstrap-groups
+          configMap:
+            name: {{ include "lldap.fullname" . }}-bootstrap
+            items:
+              - key: groups.json
+                path: groups.json
+        - name: secrets
+          secret:
+            secretName: {{ default (printf "%s-secrets" (include "lldap.fullname" .)) .Values.lldap.existingSecret }}
+        {{- if and .Values.ldaps.enabled .Values.ldaps.existingSecret }}
+        - name: ldaps-cert
+          secret:
+            secretName: {{ .Values.ldaps.existingSecret }}
+            items:
+              - key: {{ .Values.ldaps.certKey }}
+                path: tls.crt
+              - key: {{ .Values.ldaps.keyKey }}
+                path: tls.key
+        {{- end }}
+
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass }}
+        {{- end }}

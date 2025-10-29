@@ -1,0 +1,8 @@
+area:lldap:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "charts/lldap/**"
+
+release-lane:chart:
+  - changed-files:
+      - any-glob-to-any-file: ["charts/**"]
