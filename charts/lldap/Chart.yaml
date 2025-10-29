@@ -1,6 +1,6 @@
 apiVersion: v2
 name: lldap
-version: 0.1.0
+version: 1.0.0
 kubeVersion: ">=1.24.0-0"
 description: Lightweight LDAP server with native bootstrap and web UI
 home: https://github.com/lldap/lldap
